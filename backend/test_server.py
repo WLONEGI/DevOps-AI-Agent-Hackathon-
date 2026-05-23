@@ -155,6 +155,47 @@ def test_websocket_chat_resumption(mock_get_client):
         assert config.session_resumption.handle == "old_fake_handle"
 
 
+@patch("backend.server.get_gemini_client")
+def test_websocket_chat_vertexai_agent(mock_get_client):
+    # Setup mock Gemini client
+    mock_client = MagicMock()
+    mock_session = MockLiveSession()
+    mock_client.aio.live.connect = MagicMock(return_value=mock_session)
+    mock_get_client.return_value = mock_client
+
+    with client.websocket_connect("/api/chat?vertexai=true&project=my-project&location=us-central1&agent_id=my-agent"):
+        # Verify get_gemini_client was called with vertexai and project details
+        mock_get_client.assert_called_once_with(
+            api_key=None,
+            vertexai=True,
+            project="my-project",
+            location="us-central1",
+        )
+
+        # Verify live.connect was called with the correct Agent resource path
+        mock_client.aio.live.connect.assert_called_once()
+        called_args, called_kwargs = mock_client.aio.live.connect.call_args
+        assert called_kwargs.get("model") == "projects/my-project/locations/us-central1/agents/my-agent"
+
+        # Verify that system_instruction and speech_config are NOT set by default in config (prioritizing agent studio settings)
+        config = called_kwargs.get("config")
+        assert not hasattr(config, "system_instruction") or config.system_instruction is None
+        assert not hasattr(config, "speech_config") or config.speech_config is None
+
+
+@patch("backend.server.genai.Client")
+def test_get_gemini_client_vertexai(mock_genai_client):
+    from backend.server import get_gemini_client
+
+    # Test standard Client initialization
+    get_gemini_client(api_key="my-api-key")
+    mock_genai_client.assert_called_with(api_key="my-api-key")
+
+    # Test Vertex AI client initialization
+    get_gemini_client(vertexai=True, project="my-project", location="us-central1")
+    mock_genai_client.assert_called_with(vertexai=True, project="my-project", location="us-central1")
+
+
 if __name__ == "__main__":
     import sys
 

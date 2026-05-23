@@ -25,7 +25,18 @@ app = FastAPI(title="Personal Context Engine Backend API")
 
 
 # Helper to initialize Gemini Client
-def get_gemini_client(api_key: str = None):
+def get_gemini_client(
+    api_key: str = None,
+    vertexai: bool = False,
+    project: str = None,
+    location: str = None,
+):
+    if vertexai:
+        proj = project or os.getenv("GOOGLE_CLOUD_PROJECT")
+        loc = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        # Initialize Client for Vertex AI (Managed Agents)
+        return genai.Client(vertexai=True, project=proj, location=loc)
+
     if api_key:
         return genai.Client(api_key=api_key)
     env_api_key = os.getenv("GOOGLE_API_KEY")
@@ -47,19 +58,45 @@ async def chat_endpoint(
     voice: str = None,
     instruction: str = None,
     resumption_token: str = None,
+    vertexai: str = None,
+    project: str = None,
+    location: str = None,
+    agent_id: str = None,
 ):
     await websocket.accept()
     logger.info("WebSocket client connected to /api/chat.")
 
+    # Determine if we should use Vertex AI
+    use_vertexai = (
+        (vertexai.lower() in ("true", "1"))
+        if vertexai
+        else (os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "false").lower() in ("true", "1"))
+    )
+    gcp_project = project or os.getenv("GOOGLE_CLOUD_PROJECT")
+    gcp_location = location or os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+    gcp_agent_id = agent_id or os.getenv("GCP_AGENT_ID")
+
     try:
-        gemini_client = get_gemini_client(key)
+        gemini_client = get_gemini_client(
+            api_key=key,
+            vertexai=use_vertexai,
+            project=gcp_project,
+            location=gcp_location,
+        )
     except Exception as e:
         logger.error(f"Failed to initialize Gemini client: {e}")
         await websocket.close(code=1008, reason="Initialization failed: " + str(e))
         return
 
-    # Use query params, env vars, or fallback default values
-    model_id = model or os.getenv("GEMINI_MODEL_ID", "gemini-3.1-flash-live-preview")
+    # Determine the model or agent resource path to connect to
+    if use_vertexai and gcp_agent_id:
+        # Managed Agent Path format: projects/{project}/locations/{location}/agents/{agent_id}
+        model_id = f"projects/{gcp_project}/locations/{gcp_location}/agents/{gcp_agent_id}"
+        logger.info(f"Connecting to Managed Agent: {model_id}")
+    else:
+        model_id = model or os.getenv("GEMINI_MODEL_ID", "gemini-3.1-flash-live-preview")
+        logger.info(f"Connecting to Model: {model_id}")
+
     voice_name = voice or os.getenv("GEMINI_VOICE_NAME", "Kore")
     system_instruction = instruction or os.getenv(
         "GEMINI_SYSTEM_INSTRUCTION",
@@ -70,8 +107,6 @@ async def chat_endpoint(
             "RESPOND IN JAPANESE. YOU MUST RESPOND UNMISTAKABLY IN JAPANESE."
         ),
     )
-
-    logger.info(f"Live API Configuration - Model: {model_id}, Voice: {voice_name}")
 
     # Configure Context Window Compression (avoids token limit issues and saves costs)
     trigger_tokens = int(os.getenv("GEMINI_COMPRESSION_TRIGGER", "25000"))
@@ -88,17 +123,32 @@ async def chat_endpoint(
     else:
         session_resumption = types.SessionResumptionConfig(transparent=True)
 
-    config = types.LiveConnectConfig(
-        response_modalities=["AUDIO"],
-        input_audio_transcription=types.AudioTranscriptionConfig(),
-        output_audio_transcription=types.AudioTranscriptionConfig(),
-        speech_config=types.SpeechConfig(
+    # Base configuration parameters
+    config_params = {
+        "response_modalities": ["AUDIO"],
+        "input_audio_transcription": types.AudioTranscriptionConfig(),
+        "output_audio_transcription": types.AudioTranscriptionConfig(),
+        "context_window_compression": context_compression,
+        "session_resumption": session_resumption,
+    }
+
+    # For Managed Agent, we prioritize GCP-side configurations (system prompt, voice).
+    # We only override them if they are explicitly passed as query parameters (instruction or voice is not None).
+    if use_vertexai and gcp_agent_id:
+        if instruction is not None:
+            config_params["system_instruction"] = instruction
+        if voice is not None:
+            config_params["speech_config"] = types.SpeechConfig(
+                voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))
+            )
+    else:
+        # Standard configuration for developer API
+        config_params["system_instruction"] = system_instruction
+        config_params["speech_config"] = types.SpeechConfig(
             voice_config=types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name))
-        ),
-        system_instruction=system_instruction,
-        context_window_compression=context_compression,
-        session_resumption=session_resumption,
-    )
+        )
+
+    config = types.LiveConnectConfig(**config_params)
 
     try:
         async with gemini_client.aio.live.connect(model=model_id, config=config) as session:
