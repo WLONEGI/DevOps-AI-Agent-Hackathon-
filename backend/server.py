@@ -117,11 +117,20 @@ async def chat_endpoint(
     )
 
     # Configure Session Resumption
-    if resumption_token:
-        logger.info(f"Attempting to resume session with token: {resumption_token}")
-        session_resumption = types.SessionResumptionConfig(handle=resumption_token, transparent=True)
+    # The 'transparent' parameter is only supported in Vertex AI (Managed Agent) mode,
+    # and must be omitted for the standard Gemini Developer API mode.
+    if use_vertexai:
+        if resumption_token:
+            logger.info(f"Attempting to resume session with token: {resumption_token}")
+            session_resumption = types.SessionResumptionConfig(handle=resumption_token, transparent=True)
+        else:
+            session_resumption = types.SessionResumptionConfig(transparent=True)
     else:
-        session_resumption = types.SessionResumptionConfig(transparent=True)
+        if resumption_token:
+            logger.info(f"Attempting to resume session with token: {resumption_token}")
+            session_resumption = types.SessionResumptionConfig(handle=resumption_token)
+        else:
+            session_resumption = types.SessionResumptionConfig()
 
     # Base configuration parameters
     config_params = {
