@@ -1,0 +1,17 @@
+.git
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.DS_Store
+
+# Exclude iOS client code
+ios/
+
+# Exclude benchmarks and scratch files
+scratch/
+latency_test.py
+benchmark_report.md
+query.pcm
+query.wav

@@ -1,0 +1,42 @@
+# Ruff configurations for backend
+target-version = "py311"
+line-length = 120
+exclude = [
+    ".git",
+    ".venv",
+    "__pycache__",
+]
+
+[lint]
+# Enable standard rules (E, F, W, I, N, UP, B, A, C4, T20, PT, RET, SIM, PTH)
+select = [
+    "E",   # pycodestyle errors
+    "F",   # Pyflakes
+    "W",   # pycodestyle warnings
+    "I",   # isort (import sorting)
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "A",   # flake8-builtins
+    "C4",  # flake8-comprehensions
+    "T20", # flake8-print
+    "PT",  # flake8-pytest-style
+    "RET", # flake8-return
+    "SIM", # flake8-simplify
+    "PTH", # flake8-use-pathlib
+]
+
+ignore = ["E501", "B008", "E402", "SIM105", "E722", "B904", "SIM108"]
+
+
+[lint.per-file-ignores]
+"test_*.py" = ["T201"] # Allow print in test files
+"test_server.py" = ["T201"]
+
+
+
+[format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
