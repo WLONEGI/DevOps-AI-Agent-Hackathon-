@@ -1,11 +1,7 @@
 import asyncio
 import base64
 import json
-import warnings
 from unittest.mock import MagicMock, patch
-
-# Ignore Google GenAI SDK's internal deprecation warning under Python 3.14+
-warnings.filterwarnings("ignore", category=DeprecationWarning, module="google.genai")
 
 from backend.server import app
 from fastapi.testclient import TestClient
