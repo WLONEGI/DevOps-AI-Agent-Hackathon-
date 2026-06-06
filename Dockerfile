@@ -19,4 +19,5 @@ COPY backend/ /app/backend/
 EXPOSE 8080
 
 # Run the FastAPI server using uvicorn on the port injected by Cloud Run
-CMD ["sh", "-c", "uvicorn backend.server:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["sh", "-c", "uvicorn backend.app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+

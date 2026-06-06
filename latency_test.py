@@ -8,7 +8,7 @@ from google.genai import types
 from google.cloud import texttospeech
 
 # Configuration
-API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDGe9XWeJ3Ln5YcjqzYDY-R-S1mhf-XFbc")
+API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
 PROJECT_ID = "devops-ai-agent-hackathon"
 LIVE_MODEL = "gemini-3.1-flash-live-preview"
 TEXT_MODEL = "gemini-3.5-flash"
