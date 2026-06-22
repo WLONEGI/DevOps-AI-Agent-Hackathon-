@@ -1,5 +1,4 @@
 import asyncio
-import base64
 import os
 import sys
 import time
@@ -7,17 +6,18 @@ from google import genai
 from google.genai import types
 from google.cloud import texttospeech
 
-# Configuration
-API_KEY = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+# Configuration for Vertex AI
 PROJECT_ID = "devops-ai-agent-hackathon"
-LIVE_MODEL = "gemini-3.1-flash-live-preview"
-TEXT_MODEL = "gemini-3.5-flash"
+LOCATION = "us-central1"
+LIVE_MODEL = "publishers/google/models/gemini-live-2.5-flash-native-audio"
+TEXT_MODEL = "publishers/google/models/gemini-2.5-flash"
 QUERY_TEXT = "こんにちは。今日の天気はどうですか？"
 RUNS = 3 # Reduce runs to 3 for faster validation
 
-# Initialize clients
-client_us = genai.Client(api_key=API_KEY)
-client_global = genai.Client(api_key=API_KEY)
+# Initialize clients using Vertex AI and ADC
+print("Initializing Vertex AI GenAI Client (ADC)...")
+client = genai.Client(vertexai=True, project=PROJECT_ID, location=LOCATION)
+print("Initializing Google Cloud Text-to-Speech Client...")
 tts_client = texttospeech.TextToSpeechClient()
 
 def generate_query_audio():
@@ -43,7 +43,7 @@ def generate_query_audio():
 
 async def run_pipeline_a():
     """
-    Pipeline A: Gemini Live API
+    Pipeline A: Gemini Live API on Vertex AI
     WebSocket bidirectional audio streaming
     """
     pcm_bytes = open("query.pcm", "rb").read()
@@ -63,8 +63,8 @@ async def run_pipeline_a():
     t_send_end = None
     
     try:
-        print("\n  Connecting to Live API WebSocket...")
-        async with client_us.aio.live.connect(model=LIVE_MODEL, config=config) as session:
+        print("\n  Connecting to Vertex AI Live API WebSocket...")
+        async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
             print("  Connected. Starting receive loop task...")
             
             # Start receiving loop in background task
@@ -156,7 +156,7 @@ async def run_pipeline_b():
     
     try:
         # 1. Start Gemini Content Stream
-        response_stream = await client_global.aio.models.generate_content_stream(
+        response_stream = await client.aio.models.generate_content_stream(
             model=TEXT_MODEL,
             contents=contents
         )
@@ -230,14 +230,14 @@ async def main():
     if not os.path.exists("query.wav") or not os.path.exists("query.pcm"):
         generate_query_audio()
         
-    print("\nStarting Benchmarks...")
+    print("\nStarting Benchmarks on Vertex AI...")
     print(f"Number of runs: {RUNS}\n")
     
     pipeline_a_results = []
     pipeline_b_results = []
     
     # Run Pipeline A
-    print("Running Pipeline A (Gemini Live API)...")
+    print("Running Pipeline A (Vertex AI Live API)...")
     for r in range(RUNS):
         print(f"  Run {r+1}/{RUNS}...")
         res = await run_pipeline_a()
@@ -278,13 +278,13 @@ async def main():
     # Average functions
     avg = lambda x: sum(x) / len(x)
     
-    report = f"""# Latency Benchmark Results
+    report = f"""# GCP Vertex AI Audio Response Latency Benchmark Results
 
 ## Test Configurations
-- **Gemini API Endpoint**: Google AI Studio (API Key Auth)
-- **GCP Project (TTS)**: `{PROJECT_ID}`
+- **GCP Project**: `{PROJECT_ID}`
+- **Vertex AI Region**: `{LOCATION}`
 - **Input Query**: "{QUERY_TEXT}" (~3.3s audio duration)
-- **Pipeline A (Live API)**:
+- **Pipeline A (GCP Live API)**:
   - Model: `{LIVE_MODEL}`
   - Input: Raw PCM streamed in 32ms chunks (~3.3s sending duration)
   - Output: Native Audio Output (streamed WebSocket chunks)
@@ -296,7 +296,7 @@ async def main():
 
 ## Latency Summary Table
 
-| Metric (ms) | Pipeline A (Live API) | Pipeline B (STT + Gemini + TTS) | Difference (B - A) |
+| Metric (ms) | Pipeline A (GCP Live API) | Pipeline B (STT + Gemini + TTS) | Difference (B - A) |
 | :--- | :--- | :--- | :--- |
 | **First Audio Frame Latency (Avg)** | **{avg(a_post_speech):.1f} ms** | **{avg(b_total):.1f} ms** | **{avg(b_total) - avg(a_post_speech):.1f} ms** |
 | Min Latency | {min(a_post_speech):.1f} ms | {min(b_total):.1f} ms | - |
@@ -314,19 +314,18 @@ async def main():
 - **Combined Pipeline B Total Latency**: {avg(b_total):.1f} ms
 
 ## Key Findings
-1. **Live API Latency Advantage**: The Gemini Live API (`{LIVE_MODEL}`) has a significant advantage because it processes audio bidirectionally and streams native audio output without waiting for sentence completion or running a separate TTS step.
+1. **Live API Latency Advantage**: The GCP Live API (`{LIVE_MODEL.split('/')[-1]}`) has a significant advantage because it processes audio bidirectionally and streams native audio output without waiting for sentence completion or running a separate TTS step.
 2. **Sequential Overhead**: Pipeline B requires Gemini to generate the text of the first sentence, wait for punctuation delimiters, transmit the text to the client, call the TTS API, wait for synthesis to complete, and then begin playback. This introduces sequential API overhead.
-
 """
     
     print("\n================ BENCHMARK REPORT ================")
     print(report)
     print("==================================================")
     
-    with open("benchmark_report.md", "w") as f:
+    with open("benchmark_report_vertex.md", "w") as f:
         f.write(report)
         
-    print("\nSaved report to benchmark_report.md")
+    print("\nSaved report to benchmark_report_vertex.md")
 
 if __name__ == "__main__":
     asyncio.run(main())

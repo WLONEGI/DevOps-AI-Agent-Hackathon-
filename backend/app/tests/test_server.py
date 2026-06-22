@@ -150,12 +150,19 @@ def test_websocket_chat_vertexai_agent(mock_gemini_class):
         assert "text" in received_types
         assert "user_text" in received_types
 
+    mock_gemini_class.assert_called_once_with(
+        model="projects/my-project/locations/us-central1/agents/my-agent",
+        use_vertexai_flag=True,
+        project="my-project",
+        location="us-central1",
+    )
+
 
 @patch("backend.app.main.ADKGemini")
-def test_websocket_chat_standard_gemini(mock_gemini_class):
-    mock_connection = setup_mock_gemini_connection(mock_gemini_class)
+def test_websocket_chat_vertexai_direct_model(mock_gemini_class):
+    setup_mock_gemini_connection(mock_gemini_class)
 
-    with client.websocket_connect("/api/chat?vertexai=false&model=gemini-3.1-flash-live-preview") as ws:
+    with client.websocket_connect("/api/chat?vertexai=true&model=publishers/google/models/gemini-2.0-flash-exp") as ws:
         # Send text image message
         ws.send_text(json.dumps({"type": "image", "data": base64.b64encode(b"fakeimage").decode("utf-8")}))
 
@@ -175,8 +182,67 @@ def test_websocket_chat_standard_gemini(mock_gemini_class):
         assert "text" in received_types
         assert "user_text" in received_types
 
-        # Verify connection.send_realtime was called
-        mock_connection.send_realtime.assert_called()
+
+@patch("backend.app.main.ADKGemini")
+def test_websocket_chat_vertexai_direct_model_with_params(mock_gemini_class):
+    setup_mock_gemini_connection(mock_gemini_class)
+
+    with client.websocket_connect(
+        "/api/chat?vertexai=true&model=publishers/google/models/gemini-2.0-flash-exp&project=my-project&location=us-east1"
+    ) as ws:
+        # Send text image message
+        ws.send_text(json.dumps({"type": "image", "data": base64.b64encode(b"fakeimage").decode("utf-8")}))
+
+        # Send text audio message
+        ws.send_text(json.dumps({"type": "audio", "data": base64.b64encode(b"fakeaudio").decode("utf-8")}))
+
+        # Send stop message
+        ws.send_text(json.dumps({"type": "stop"}))
+
+        # Receive mock responses from WebSocket
+        received_types = []
+        for _ in range(3):
+            resp = ws.receive_json()
+            received_types.append(resp.get("type"))
+
+        assert "audio" in received_types
+        assert "text" in received_types
+        assert "user_text" in received_types
+
+    mock_gemini_class.assert_called_once_with(
+        model="publishers/google/models/gemini-2.0-flash-exp",
+        use_vertexai_flag=True,
+        project="my-project",
+        location="us-east1",
+    )
+
+
+@patch("backend.app.main.ADKGemini")
+def test_websocket_chat_standard_gemini(mock_gemini_class):
+    mock_connection = setup_mock_gemini_connection(mock_gemini_class)
+
+    with client.websocket_connect("/api/chat?vertexai=false&model=gemini-2.5-flash-native-audio-preview-12-2025") as ws:
+        # Send text image message
+        ws.send_text(json.dumps({"type": "image", "data": base64.b64encode(b"fakeimage").decode("utf-8")}))
+
+        # Send text audio message
+        ws.send_text(json.dumps({"type": "audio", "data": base64.b64encode(b"fakeaudio").decode("utf-8")}))
+
+        # Send stop message
+        ws.send_text(json.dumps({"type": "stop"}))
+
+        # Receive mock responses from WebSocket
+        received_types = []
+        for _ in range(3):
+            resp = ws.receive_json()
+            received_types.append(resp.get("type"))
+
+        assert "audio" in received_types
+        assert "text" in received_types
+        assert "user_text" in received_types
+
+        # Verify connection.send_realtime_input was called
+        mock_connection._gemini_session.send_realtime_input.assert_called()
 
 
 def test_websocket_chat_invalid_parameters():
@@ -222,6 +288,36 @@ def test_websocket_chat_invalid_parameters():
     ):
         ws.receive_text()
     assert excinfo.value.code == 1011
+
+    # 6. Test invalid direct Vertex AI model format
+    with (
+        pytest.raises(WebSocketDisconnect) as excinfo,
+        client.websocket_connect("/api/chat?vertexai=true&model=publishers/invalid;model") as ws,
+    ):
+        ws.receive_text()
+    assert excinfo.value.code == 1011
+
+    # 7. Test invalid vertexai parameter format
+    with (
+        pytest.raises(WebSocketDisconnect) as excinfo,
+        client.websocket_connect("/api/chat?vertexai=invalid") as ws,
+    ):
+        ws.receive_text()
+    assert excinfo.value.code == 1011
+
+
+def test_create_live_connect_config():
+    from backend.app.gemini import create_live_connect_config
+    from google.genai import types
+
+    config = create_live_connect_config(
+        use_vertexai=False,
+        gcp_agent_id=None,
+        voice_name="Puck",
+        resumption_token=None,
+    )
+    assert config.realtime_input_config is not None
+    assert config.realtime_input_config.activity_handling == types.ActivityHandling.NO_INTERRUPTION
 
 
 if __name__ == "__main__":

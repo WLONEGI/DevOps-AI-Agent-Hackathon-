@@ -4,53 +4,16 @@ import json
 import logging
 import re
 import secrets
-from functools import cached_property
 
 from backend.app.config import settings
-from backend.app.gemini import create_live_connect_config
+from backend.app.gemini import ADKGemini, create_live_connect_config
 from fastapi import (
     FastAPI,
     WebSocket,
     WebSocketDisconnect,
 )
-from google.adk.models.google_llm import Gemini as OriginalADKGemini
 from google.adk.models.llm_request import LlmRequest
-from google.genai import Client, types
-
-
-class ADKGemini(OriginalADKGemini):
-    use_vertexai_flag: bool = False
-
-    @cached_property
-    def api_client(self) -> Client:
-        base_url, api_version = self._base_url_and_api_version
-        kwargs_for_http_options = {
-            "headers": self._tracking_headers(),
-            "retry_options": self.retry_options,
-            "base_url": base_url,
-        }
-        if api_version:
-            kwargs_for_http_options["api_version"] = api_version
-
-        kwargs = {
-            "http_options": types.HttpOptions(**kwargs_for_http_options),
-            "vertexai": self.use_vertexai_flag,
-        }
-        return Client(**kwargs)
-
-    @cached_property
-    def _live_api_client(self) -> Client:
-        base_url, _ = self._base_url_and_api_version
-        kwargs = {
-            "http_options": types.HttpOptions(
-                headers=self._tracking_headers(),
-                api_version=self._live_api_version,
-                base_url=base_url,
-            ),
-            "vertexai": self.use_vertexai_flag,
-        }
-        return Client(**kwargs)
-
+from google.genai import types
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -58,11 +21,13 @@ logger = logging.getLogger("server")
 
 # Validation patterns to prevent injection attacks
 GCP_PROJECT_PATTERN = re.compile(r"^[a-z0-9-]{6,30}$")
-GCP_LOCATION_PATTERN = re.compile(r"^[a-z0-9-]+$")
-GCP_AGENT_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
-GEMINI_MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9.-]+$")
+GCP_LOCATION_PATTERN = re.compile(r"^[a-z0-9-]{1,50}$")
+GCP_AGENT_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,100}$")
+MODEL_PATTERN = re.compile(r"^[a-zA-Z0-9./_-]{1,200}$")
 VOICE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,50}$")
-RESUMPTION_TOKEN_PATTERN = re.compile(r"^[a-zA-Z0-9_=-]+$")
+RESUMPTION_TOKEN_PATTERN = re.compile(r"^[a-zA-Z0-9_=-]{1,4096}$")
+VERTEXAI_PATTERN = re.compile(r"^(true|false|1|0)$", re.IGNORECASE)
+
 
 app = FastAPI(title="Personal Context Engine Backend API")
 
@@ -90,11 +55,23 @@ async def validate_parameter(
     pattern: re.Pattern,
     param_name: str,
     placeholder: str | tuple[str, ...] | None = None,
+    required: bool = True,
 ) -> bool:
     """Validates a parameter value against a regex pattern and check for configuration/placeholder errors.
 
     If validation fails, logs the error and closes the WebSocket connection.
     """
+    if not value:
+        if required:
+            await log_and_close_websocket(
+                websocket,
+                code=1011,
+                log_msg=f"{param_name} is not configured. Rejecting connection.",
+                client_reason=f"{param_name} is not configured.",
+            )
+            return False
+        return True
+
     is_placeholder = False
     if placeholder:
         if isinstance(placeholder, str):
@@ -102,7 +79,7 @@ async def validate_parameter(
         else:
             is_placeholder = value in placeholder
 
-    if not value or is_placeholder:
+    if is_placeholder:
         await log_and_close_websocket(
             websocket,
             code=1011,
@@ -123,21 +100,61 @@ async def validate_parameter(
     return True
 
 
+MAX_PAYLOAD_SIZE = settings.MAX_PAYLOAD_SIZE
+MIME_TYPES = {
+    "audio": "audio/pcm;rate=16000",
+    "image": "image/jpeg",
+}
+
+
 async def decode_and_send_blob(connection, base64_data: str, mime_type: str, msg_type: str):
     """Decodes base64 data and sends it to Gemini Live session as a Blob."""
+    # Prevent memory exhaustion (DoS) by checking raw base64 string length.
+    # Base64 string length of N bytes is approximately 4 * N / 3.
+    # 5MB decoded bytes limit corresponds to about 6.7M characters.
+    if len(base64_data) > (MAX_PAYLOAD_SIZE * 4 // 3 + 4):
+        logger.warning(f"Rejected base64 {msg_type} data: payload size too large.")
+        return
+
+    if not hasattr(connection, "_gemini_session") or connection._gemini_session is None:
+        logger.error("Invalid connection: _gemini_session is not initialized.")
+        return
+
     try:
-        chunk = base64.b64decode(base64_data)
+        if len(base64_data) > 65536:
+            chunk = await asyncio.to_thread(base64.b64decode, base64_data)
+        else:
+            chunk = base64.b64decode(base64_data)
     except Exception as e:
         logger.warning(f"Failed to decode base64 {msg_type} data: {e}")
         return
+
+    # Double check decoded byte size to prevent memory exhaustion
+    if len(chunk) > MAX_PAYLOAD_SIZE:
+        logger.warning(f"Rejected decoded {msg_type} data: payload size too large.")
+        return
+
     blob = types.Blob(data=chunk, mime_type=mime_type)
-    await connection.send_realtime(blob)
+
+    # Bypass google-adk's send_realtime which incorrectly falls back to media=blob
+    # for non-3.1 Gemini Live models (like 2.5 Flash), leading to ignored inputs.
+    # Instead, we directly send using correct 'audio' or 'video' parameters.
+    try:
+        if msg_type == "audio":
+            await connection._gemini_session.send_realtime_input(audio=blob)
+        elif msg_type == "image":
+            await connection._gemini_session.send_realtime_input(video=blob)
+    except Exception as e:
+        logger.error(f"Error sending realtime {msg_type} input to Gemini: {e}")
+        raise
 
 
 async def run_gemini_adk_live(
     websocket: WebSocket,
     model_id: str,
     use_vertexai: bool,
+    gcp_project: str | None = None,
+    gcp_location: str | None = None,
     gcp_agent_id: str | None = None,
     resumption_token: str | None = None,
     voice: str | None = None,
@@ -146,12 +163,19 @@ async def run_gemini_adk_live(
     """Handles Gemini Live session (standard or Enterprise Agent Platform) streaming via WebSockets using google-adk."""
     logger.info(f"Connecting to Gemini Live session: {model_id} (VertexAI={use_vertexai})")
 
+    # Unify system instruction resolution.
+    # For Managed Agent, we only override system instruction if instruction is explicitly requested.
+    # We handle it cleanly via LlmRequest.config below, which ADKGemini.connect will map.
+    is_managed_agent = use_vertexai and gcp_agent_id
+    sys_instruction = instruction
+    if not is_managed_agent and sys_instruction is None:
+        sys_instruction = settings.GEMINI_SYSTEM_INSTRUCTION
+
     # Construct LiveConnectConfig
     live_config = create_live_connect_config(
         use_vertexai=use_vertexai,
         gcp_agent_id=gcp_agent_id if use_vertexai else None,
         voice_name=voice,
-        system_instruction=instruction,
         resumption_token=resumption_token,
     )
 
@@ -159,48 +183,73 @@ async def run_gemini_adk_live(
         model=model_id,
         live_config=live_config,
         config=types.GenerateContentConfig(
-            system_instruction=instruction or settings.GEMINI_SYSTEM_INSTRUCTION,
+            system_instruction=sys_instruction,
         ),
     )
 
-    adk_gemini = ADKGemini(model=model_id, use_vertexai_flag=use_vertexai)
+    adk_gemini = ADKGemini(
+        model=model_id,
+        use_vertexai_flag=use_vertexai,
+        project=gcp_project,
+        location=gcp_location,
+    )
 
     async def client_to_gemini(connection):
         try:
-            # Map message types to their respective MIME types for processing
-            mime_types = {
-                "audio": "audio/pcm;rate=16000",
-                "image": "image/jpeg",
-            }
             while True:
                 try:
                     message = await websocket.receive_text()
+                    # Limit incoming message size to prevent DoS memory exhaustion
+                    if len(message) > settings.MAX_WEBSOCKET_MESSAGE_SIZE:
+                        logger.warning(
+                            f"Received WebSocket message exceeding size limit ({settings.MAX_WEBSOCKET_MESSAGE_SIZE} bytes)."
+                        )
+                        await safe_close_websocket(websocket, code=1009, reason="Message too large")
+                        break
+
                     data = json.loads(message)
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Malformed JSON received from client: {e}")
+                    continue
+                except (WebSocketDisconnect, asyncio.CancelledError):
+                    raise
+                except Exception as e:
+                    logger.error(f"Error reading client message: {e}")
+                    raise
 
-                    if not isinstance(data, dict):
-                        logger.warning("Received JSON is not a dictionary.")
-                        continue
+                if not isinstance(data, dict):
+                    logger.warning("Received JSON is not a dictionary.")
+                    continue
 
-                    msg_type = data.get("type")
+                msg_type = data.get("type")
+                if not msg_type:
+                    logger.warning("Received message with missing 'type'.")
+                    continue
 
-                    if msg_type in mime_types:
+                # Gemini transmission logic: propagate errors to terminate the session if connection is dead
+                try:
+                    if msg_type in MIME_TYPES:
                         payload = data.get("data")
                         if payload and isinstance(payload, str):
-                            await decode_and_send_blob(connection, payload, mime_types[msg_type], msg_type)
+                            await decode_and_send_blob(connection, payload, MIME_TYPES[msg_type], msg_type)
                         else:
                             logger.warning(f"Payload for {msg_type} is empty or not a string.")
                     elif msg_type == "stop":
                         logger.info("Received stop signal from client. Sending audio_stream_end...")
-                        await connection._gemini_session.send_realtime_input(audio_stream_end=True)
-                        break
+                        if not hasattr(connection, "_gemini_session") or connection._gemini_session is None:
+                            logger.error("Invalid connection: _gemini_session is not initialized. Cannot send stop.")
+                        else:
+                            try:
+                                await connection._gemini_session.send_realtime_input(audio_stream_end=True)
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to send audio_stream_end to Gemini (session may be already responding or inactive): {e}"
+                                )
                     else:
                         logger.warning(f"Unknown message type received from client: {msg_type}")
-                except json.JSONDecodeError as e:
-                    logger.warning(f"Malformed JSON received from client: {e}")
-                except (WebSocketDisconnect, asyncio.CancelledError):
-                    raise
                 except Exception as e:
-                    logger.error(f"Error processing client message: {e}")
+                    logger.error(f"Gemini transmission error: {e}")
+                    raise
         except WebSocketDisconnect:
             logger.info("Client WebSocket disconnected in client_to_gemini loop.")
         except asyncio.CancelledError:
@@ -240,7 +289,14 @@ async def run_gemini_adk_live(
                             await websocket.send_json({"type": "text", "data": part.text})
                         inline_data = getattr(part, "inline_data", None)
                         if inline_data and getattr(inline_data, "data", None):
-                            base64_audio = base64.b64encode(inline_data.data).decode("utf-8")
+                            data_bytes = inline_data.data
+                            if len(data_bytes) > 65536:
+                                # Offload CPU-bound base64 encoding to a thread pool for large data
+                                base64_audio = await asyncio.to_thread(
+                                    lambda d: base64.b64encode(d).decode("utf-8"), data_bytes
+                                )
+                            else:
+                                base64_audio = base64.b64encode(data_bytes).decode("utf-8")
                             await websocket.send_json({"type": "audio", "data": base64_audio})
         except WebSocketDisconnect:
             logger.info("Client WebSocket disconnected in gemini_to_client loop.")
@@ -248,6 +304,7 @@ async def run_gemini_adk_live(
             logger.info("gemini_to_client task cancelled.")
         except Exception as e:
             logger.error(f"Error in gemini_to_client: {e}")
+            raise
 
     try:
         async with adk_gemini.connect(llm_request) as connection:
@@ -255,17 +312,23 @@ async def run_gemini_adk_live(
             task_recv = asyncio.create_task(gemini_to_client(connection))
 
             try:
-                await asyncio.wait({task_send, task_recv}, return_when=asyncio.FIRST_COMPLETED)
+                done, pending = await asyncio.wait({task_send, task_recv}, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    if not task.cancelled():
+                        exc = task.exception()
+                        if exc:
+                            raise exc
             finally:
                 task_send.cancel()
                 task_recv.cancel()
+                await asyncio.gather(task_send, task_recv, return_exceptions=True)
     except Exception as e:
         logger.error(f"Gemini connection error: {e}")
         raise
 
 
 @app.get("/health")
-def health_check():
+async def health_check():
     return {"status": "ok"}
 
 
@@ -292,29 +355,26 @@ async def chat_endpoint(
         )
         return
 
-    # Validate voice parameter if provided
-    if voice and not VOICE_PATTERN.match(voice):
-        await log_and_close_websocket(
-            websocket, code=1011, log_msg=f"Invalid voice format: {voice}", client_reason="Invalid voice format."
-        )
+    # Validate optional voice parameter if provided
+    if not await validate_parameter(websocket, voice, VOICE_PATTERN, "voice", required=False):
         return
 
-    # Validate resumption_token if provided
-    if resumption_token and not RESUMPTION_TOKEN_PATTERN.match(resumption_token):
-        await log_and_close_websocket(
-            websocket,
-            code=1011,
-            log_msg=f"Invalid resumption token format: {resumption_token}",
-            client_reason="Invalid resumption token format.",
-        )
+    # Validate optional resumption_token parameter if provided
+    if not await validate_parameter(
+        websocket, resumption_token, RESUMPTION_TOKEN_PATTERN, "resumption token", required=False
+    ):
+        return
+
+    # Validate optional vertexai parameter if provided
+    if not await validate_parameter(websocket, vertexai, VERTEXAI_PATTERN, "vertexai", required=False):
         return
 
     # Validate instruction parameter length if provided (limit to prevent DoS/excessive memory usage)
-    if instruction and len(instruction) > 4096:
+    if instruction and len(instruction) > settings.MAX_INSTRUCTION_LENGTH:
         await log_and_close_websocket(
             websocket,
             code=1011,
-            log_msg="Instruction parameter exceeds maximum allowed length of 4096 characters.",
+            log_msg=f"Instruction parameter exceeds maximum allowed length of {settings.MAX_INSTRUCTION_LENGTH} characters.",
             client_reason="Instruction exceeds maximum length.",
         )
         return
@@ -324,30 +384,47 @@ async def chat_endpoint(
     if vertexai is not None:
         use_vertexai = vertexai.lower() in ("true", "1")
 
+    gcp_project = None
+    gcp_location = None
+
     if use_vertexai:
-        gcp_project = project or settings.GOOGLE_CLOUD_PROJECT
-        gcp_location = location or settings.GOOGLE_CLOUD_LOCATION
-        gcp_agent_id = agent_id or settings.GCP_AGENT_ID
+        gcp_project = project if project else settings.GOOGLE_CLOUD_PROJECT
+        gcp_location = location if location else settings.GOOGLE_CLOUD_LOCATION
 
-        if not await validate_parameter(
-            websocket, gcp_project, GCP_PROJECT_PATTERN, "GCP project", "your-gcp-project-id"
-        ):
-            return
+        # Force us-central1 for Gemini Live API if default location is not a supported Live API region
+        if not location and gcp_location not in ("us-central1", "europe-west4"):
+            logger.warning(
+                f"Default location {gcp_location} does not support Gemini Live API. Falling back to us-central1."
+            )
+            gcp_location = "us-central1"
 
-        if not await validate_parameter(websocket, gcp_location, GCP_LOCATION_PATTERN, "GCP location"):
-            return
+        if model and (model.startswith("publishers/") or model.startswith("gemini-")):
+            model_id = model
+            gcp_agent_id = None
+            if not await validate_parameter(websocket, model_id, MODEL_PATTERN, "direct Vertex AI model"):
+                return
+            logger.info(f"Routing to direct Vertex AI model: {model_id}")
+        else:
+            gcp_agent_id = agent_id if agent_id else settings.GCP_AGENT_ID
+            if not await validate_parameter(
+                websocket, gcp_project, GCP_PROJECT_PATTERN, "GCP project", "your-gcp-project-id"
+            ):
+                return
 
-        if not await validate_parameter(
-            websocket, gcp_agent_id, GCP_AGENT_PATTERN, "GCP_AGENT_ID", ("YOUR_GCP_AGENT_ID", "your-agent-id")
-        ):
-            return
+            if not await validate_parameter(websocket, gcp_location, GCP_LOCATION_PATTERN, "GCP location"):
+                return
 
-        model_id = f"projects/{gcp_project}/locations/{gcp_location}/agents/{gcp_agent_id}"
-        logger.info(f"Routing to Vertex AI Agent Platform: {model_id}")
+            if not await validate_parameter(
+                websocket, gcp_agent_id, GCP_AGENT_PATTERN, "GCP_AGENT_ID", ("YOUR_GCP_AGENT_ID", "your-agent-id")
+            ):
+                return
+
+            model_id = f"projects/{gcp_project}/locations/{gcp_location}/agents/{gcp_agent_id}"
+            logger.info(f"Routing to Vertex AI Agent Platform: {model_id}")
     else:
-        model_id = model or settings.GEMINI_MODEL_ID
+        model_id = model if model else settings.GEMINI_MODEL_ID
         gcp_agent_id = None
-        if not await validate_parameter(websocket, model_id, GEMINI_MODEL_PATTERN, "GEMINI_MODEL_ID"):
+        if not await validate_parameter(websocket, model_id, MODEL_PATTERN, "GEMINI_MODEL_ID"):
             return
         logger.info(f"Routing to standard developer Gemini Live API: {model_id}")
 
@@ -359,11 +436,15 @@ async def chat_endpoint(
             websocket=websocket,
             model_id=model_id,
             use_vertexai=use_vertexai,
+            gcp_project=gcp_project,
+            gcp_location=gcp_location,
             gcp_agent_id=gcp_agent_id,
             resumption_token=resumption_token,
             voice=voice,
             instruction=instruction,
         )
+    except WebSocketDisconnect:
+        logger.info("WebSocket client disconnected normally in chat_endpoint.")
     except Exception as e:
         logger.error(f"Gemini Live session error: {e}")
         await safe_close_websocket(websocket, code=1011, reason=str(e))
