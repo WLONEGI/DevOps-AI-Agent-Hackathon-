@@ -398,12 +398,7 @@ async def chat_endpoint(
 
     if use_vertexai:
         gcp_project = project if project else settings.GOOGLE_CLOUD_PROJECT
-        gcp_location = location if location else settings.GOOGLE_CLOUD_LOCATION
-
-        # Force us-central1 for Gemini Live API if location is not a supported Live API region
-        if gcp_location not in ("us-central1", "europe-west4"):
-            logger.warning(f"Location {gcp_location} does not support Gemini Live API. Falling back to us-central1.")
-            gcp_location = "us-central1"
+        gcp_location = "us-central1"
 
         if model and (model.startswith("publishers/") or model.startswith("gemini-")):
             model_id = model

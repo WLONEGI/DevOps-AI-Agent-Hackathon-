@@ -213,7 +213,7 @@ def test_websocket_chat_vertexai_direct_model_with_params(mock_gemini_class):
         model="publishers/google/models/gemini-2.0-flash-exp",
         use_vertexai_flag=True,
         project="my-project",
-        location="europe-west4",
+        location="us-central1",
     )
 
 
