@@ -398,7 +398,7 @@ async def chat_endpoint(
 
     if use_vertexai:
         gcp_project = project if project else settings.GOOGLE_CLOUD_PROJECT
-        gcp_location = "us-central1"
+        gcp_location = settings.GOOGLE_CLOUD_LOCATION
 
         if model and (model.startswith("publishers/") or model.startswith("gemini-")):
             model_id = model
