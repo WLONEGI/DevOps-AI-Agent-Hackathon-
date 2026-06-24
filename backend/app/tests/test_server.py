@@ -188,7 +188,7 @@ def test_websocket_chat_vertexai_direct_model_with_params(mock_gemini_class):
     setup_mock_gemini_connection(mock_gemini_class)
 
     with client.websocket_connect(
-        "/api/chat?vertexai=true&model=publishers/google/models/gemini-2.0-flash-exp&project=my-project&location=us-east1"
+        "/api/chat?vertexai=true&model=publishers/google/models/gemini-2.0-flash-exp&project=my-project&location=europe-west4"
     ) as ws:
         # Send text image message
         ws.send_text(json.dumps({"type": "image", "data": base64.b64encode(b"fakeimage").decode("utf-8")}))
@@ -213,7 +213,7 @@ def test_websocket_chat_vertexai_direct_model_with_params(mock_gemini_class):
         model="publishers/google/models/gemini-2.0-flash-exp",
         use_vertexai_flag=True,
         project="my-project",
-        location="us-east1",
+        location="europe-west4",
     )
 
 
