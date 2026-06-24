@@ -107,24 +107,48 @@ MIME_TYPES = {
 }
 
 
+async def _safe_b64decode(data: str) -> bytes:
+    """Decodes base64 data, offloading CPU-bound tasks for large payloads to a thread pool."""
+    if len(data) > 65536:
+        return await asyncio.to_thread(base64.b64decode, data)
+    return base64.b64decode(data)
+
+
+async def _safe_b64encode(data: bytes) -> str:
+    """Encodes bytes to base64 string, offloading CPU-bound tasks for large payloads to a thread pool."""
+    if len(data) > 65536:
+        return await asyncio.to_thread(lambda d: base64.b64encode(d).decode("utf-8"), data)
+    return base64.b64encode(data).decode("utf-8")
+
+
+async def _send_realtime_input(connection, **kwargs) -> bool:
+    """Helper to safely send realtime input to the Gemini session."""
+    session = getattr(connection, "_gemini_session", None)
+    if session is None:
+        logger.error(f"Invalid connection: _gemini_session is not initialized. Cannot send {list(kwargs.keys())}.")
+        return False
+    try:
+        await session.send_realtime_input(**kwargs)
+        return True
+    except Exception as e:
+        if "audio_stream_end" in kwargs:
+            logger.warning(
+                f"Failed to send audio_stream_end to Gemini (session may be already responding or inactive): {e}"
+            )
+        else:
+            logger.error(f"Error sending realtime input {list(kwargs.keys())} to Gemini: {e}")
+            raise
+
+
 async def decode_and_send_blob(connection, base64_data: str, mime_type: str, msg_type: str):
     """Decodes base64 data and sends it to Gemini Live session as a Blob."""
     # Prevent memory exhaustion (DoS) by checking raw base64 string length.
-    # Base64 string length of N bytes is approximately 4 * N / 3.
-    # 5MB decoded bytes limit corresponds to about 6.7M characters.
     if len(base64_data) > (MAX_PAYLOAD_SIZE * 4 // 3 + 4):
         logger.warning(f"Rejected base64 {msg_type} data: payload size too large.")
         return
 
-    if not hasattr(connection, "_gemini_session") or connection._gemini_session is None:
-        logger.error("Invalid connection: _gemini_session is not initialized.")
-        return
-
     try:
-        if len(base64_data) > 65536:
-            chunk = await asyncio.to_thread(base64.b64decode, base64_data)
-        else:
-            chunk = base64.b64decode(base64_data)
+        chunk = await _safe_b64decode(base64_data)
     except Exception as e:
         logger.warning(f"Failed to decode base64 {msg_type} data: {e}")
         return
@@ -136,17 +160,10 @@ async def decode_and_send_blob(connection, base64_data: str, mime_type: str, msg
 
     blob = types.Blob(data=chunk, mime_type=mime_type)
 
-    # Bypass google-adk's send_realtime which incorrectly falls back to media=blob
-    # for non-3.1 Gemini Live models (like 2.5 Flash), leading to ignored inputs.
-    # Instead, we directly send using correct 'audio' or 'video' parameters.
-    try:
-        if msg_type == "audio":
-            await connection._gemini_session.send_realtime_input(audio=blob)
-        elif msg_type == "image":
-            await connection._gemini_session.send_realtime_input(video=blob)
-    except Exception as e:
-        logger.error(f"Error sending realtime {msg_type} input to Gemini: {e}")
-        raise
+    if msg_type == "audio":
+        await _send_realtime_input(connection, audio=blob)
+    elif msg_type == "image":
+        await _send_realtime_input(connection, video=blob)
 
 
 async def run_gemini_adk_live(
@@ -226,7 +243,6 @@ async def run_gemini_adk_live(
                     logger.warning("Received message with missing 'type'.")
                     continue
 
-                # Gemini transmission logic: propagate errors to terminate the session if connection is dead
                 try:
                     if msg_type in MIME_TYPES:
                         payload = data.get("data")
@@ -234,17 +250,16 @@ async def run_gemini_adk_live(
                             await decode_and_send_blob(connection, payload, MIME_TYPES[msg_type], msg_type)
                         else:
                             logger.warning(f"Payload for {msg_type} is empty or not a string.")
+                    elif msg_type == "text":
+                        payload = data.get("data")
+                        if payload and isinstance(payload, str):
+                            logger.info(f"Received text prompt from client: {payload}")
+                            await _send_realtime_input(connection, text=payload)
+                        else:
+                            logger.warning("Payload for text is empty or not a string.")
                     elif msg_type == "stop":
                         logger.info("Received stop signal from client. Sending audio_stream_end...")
-                        if not hasattr(connection, "_gemini_session") or connection._gemini_session is None:
-                            logger.error("Invalid connection: _gemini_session is not initialized. Cannot send stop.")
-                        else:
-                            try:
-                                await connection._gemini_session.send_realtime_input(audio_stream_end=True)
-                            except Exception as e:
-                                logger.warning(
-                                    f"Failed to send audio_stream_end to Gemini (session may be already responding or inactive): {e}"
-                                )
+                        await _send_realtime_input(connection, audio_stream_end=True)
                     else:
                         logger.warning(f"Unknown message type received from client: {msg_type}")
                 except Exception as e:
@@ -290,13 +305,7 @@ async def run_gemini_adk_live(
                         inline_data = getattr(part, "inline_data", None)
                         if inline_data and getattr(inline_data, "data", None):
                             data_bytes = inline_data.data
-                            if len(data_bytes) > 65536:
-                                # Offload CPU-bound base64 encoding to a thread pool for large data
-                                base64_audio = await asyncio.to_thread(
-                                    lambda d: base64.b64encode(d).decode("utf-8"), data_bytes
-                                )
-                            else:
-                                base64_audio = base64.b64encode(data_bytes).decode("utf-8")
+                            base64_audio = await _safe_b64encode(data_bytes)
                             await websocket.send_json({"type": "audio", "data": base64_audio})
         except WebSocketDisconnect:
             logger.info("Client WebSocket disconnected in gemini_to_client loop.")
