@@ -49,10 +49,15 @@ We have successfully refined the iOS gateway app based on background robustness 
 ### 9. Fix Audio Playback Termination & Camera CPU Throttling
 * **[GeminiLiveClient.swift](file:///Users/negishiyuki/Developments/DevOps-AI-Agent-Hackathon-smart-glass/ios/SmartGlassesGateway/SmartGlassesGateway/Services/GeminiLiveClient.swift)**:
   - Removed `audioEngine.pause()` inside `stopRecording()` to prevent restarting the audio engine and re-activating the `AVAudioSession` during active turns, eliminating hardware/XPC conflicts.
+  - Moved `AudioConverterConsumedBox` class definition to the file scope to resolve Swift 6 / strict concurrency Main Actor isolation issues inside the Sendable audio converter block.
 * **[GlassesConnector.swift](file:///Users/negishiyuki/Developments/DevOps-AI-Agent-Hackathon-smart-glass/ios/SmartGlassesGateway/SmartGlassesGateway/Services/GlassesConnector.swift)**:
   - Added a thread-safe `CaptureThrottler` class and its `throttler` instance to perform thread-safe frame rate checks.
-  - **iOS Alternative Mode**: Implemented early-return throttling in `captureOutput` before the expensive CIContext CGImage rendering. This reduces the image processing rate from 30 FPS to 5 FPS, cutting CPU/GPU load significantly and preventing XPC connection failures.
+  - **iOS Alternative Mode**: Implemented early-return throttling in `captureOutput` before the expensive CIContext CGImage rendering. The processing rate is configured to run at 30 FPS.
   - **Real Device Mode**: Integrated the same `CaptureThrottler` check into `startRealStreaming(session:)` frame receiver block before the CPU-heavy `frame.makeUIImage()` decoding call. This prevents spikes in image decoding overhead during network bursts.
+* **[project.pbxproj](file:///Users/negishiyuki/Developments/DevOps-AI-Agent-Hackathon-smart-glass/ios/SmartGlassesGateway/SmartGlassesGateway.xcodeproj/project.pbxproj)**:
+  - Corrected Swift Package Manager dependency linking. Replaced linking against the binary target `MediaPipeTasksVision` (which is not a public SPM product) with the library product `SwiftTasksVision`.
+* **[HandGestureRecognizer.swift](file:///Users/negishiyuki/Developments/DevOps-AI-Agent-Hackathon-smart-glass/ios/SmartGlassesGateway/SmartGlassesGateway/Services/HandGestureRecognizer.swift)**:
+  - Updated result category property access from `.label` to `.categoryName` to conform with the official MediaPipe SDK class interface.
 
 ---
 
@@ -73,4 +78,5 @@ We have successfully refined the iOS gateway app based on background robustness 
    * Run the app in `iosAlternative` mode.
    * Trigger the action and talk. Verify that when Gemini responds, recording stops smoothly without restarting the audio engine or causing a `Socket is not connected` error.
    * Verify that audio response playback runs to completion without interruption.
-   * Observe CPU/GPU activity and verify that resource consumption remains low because camera frames are throttled to 5 FPS before rendering.
+   * Observe CPU/GPU activity and verify that resource consumption remains low because camera frames are processed at 30 FPS before rendering.
+
