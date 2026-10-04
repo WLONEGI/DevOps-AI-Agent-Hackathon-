@@ -7,4 +7,6 @@ __pycache__/
 *.pcm
 *.wav
 scratch/
+model/
+*.mlmodel
 

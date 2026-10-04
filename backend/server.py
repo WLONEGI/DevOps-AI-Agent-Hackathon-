@@ -1,8 +1,5 @@
-import os
-
 import uvicorn
+from backend.app.config import settings
 
 if __name__ == "__main__":
-    host = os.getenv("HOST", "0.0.0.0")  # nosec B104
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("backend.app.main:app", host=host, port=port, reload=True)
+    uvicorn.run("backend.app.main:app", host=settings.HOST, port=settings.PORT, reload=True)

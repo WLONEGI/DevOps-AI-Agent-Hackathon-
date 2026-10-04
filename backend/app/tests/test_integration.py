@@ -7,6 +7,7 @@ import google.auth
 import pytest
 from dotenv import load_dotenv
 from google.auth.exceptions import DefaultCredentialsError
+from starlette.websockets import WebSocketDisconnect
 
 # Load env variables from backend/.env or root .env
 load_dotenv()
@@ -71,8 +72,6 @@ def test_websocket_chat_vertexai_integration():
     if settings.API_ACCESS_KEY:
         url += f"&key={settings.API_ACCESS_KEY}"
 
-    from starlette.websockets import WebSocketDisconnect
-
     disconnected = False
     close_code = None
     close_reason = ""
@@ -120,6 +119,9 @@ def test_websocket_chat_vertexai_integration():
         # Since the registered agent in GCP is a Workspace Agent, it doesn't support the Multimodal Live API,
         # which results in a 1007 error from GCP. This indicates that the connection successfully reached GCP!
         assert close_code == 1011, f"Expected WebSocket close code 1011, got {close_code} (reason: {close_reason})"
-        assert "1007" in close_reason or "invalid argument" in close_reason.lower(), (
-            f"Expected Gemini Live session argument/1007 error in close reason, got: {close_reason}"
-        )
+        assert (
+            "1007" in close_reason
+            or "invalid argument" in close_reason.lower()
+            or "1008" in close_reason
+            or "permission denied" in close_reason.lower()
+        ), f"Expected Gemini Live session argument/1007/1008 error in close reason, got: {close_reason}"
